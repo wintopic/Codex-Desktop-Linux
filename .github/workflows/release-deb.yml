@@ -1,0 +1,371 @@
+name: Build and release Debian package
+
+on:
+  schedule:
+    - cron: '47 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even when the release already exists
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      upstream_ref:
+        description: Branch, tag, or commit from the upstream packaging repository
+        required: true
+        default: main
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/release-deb.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-deb-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: ilysenko/codex-desktop-linux
+  UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'main' }}
+  UPSTREAM_DMG_URL: https://persistent.oaistatic.com/codex-app-prod/Codex.dmg
+  UPSTREAM_DMG_PATH: /tmp/codex-release-deb/Codex.dmg
+  DMG_CACHE_SCHEMA_VERSION: v1
+  MAX_BUILD_THREADS: 2
+
+jobs:
+  build-and-release-deb:
+    name: Build and release .deb
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout upstream packaging source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: wrapper
+          fetch-depth: 1
+
+      - name: Capture upstream source revision
+        id: source
+        run: |
+          set -euo pipefail
+
+          source_sha="$(git -C wrapper rev-parse HEAD)"
+          source_short_sha="${source_sha:0:7}"
+
+          {
+            echo "sha=$source_sha"
+            echo "short_sha=$source_short_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Capture upstream DMG metadata
+        id: upstream-metadata
+        run: |
+          set -euo pipefail
+
+          curl_retry() {
+            local -a retry_args=(--retry 5 --retry-delay 2 --retry-connrefused)
+            if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+              retry_args+=(--retry-all-errors)
+            fi
+            curl "${retry_args[@]}" "$@"
+          }
+
+          headers_file="$(mktemp)"
+          trap 'rm -f "$headers_file"' EXIT
+
+          curl_retry -fsSLI "$UPSTREAM_DMG_URL" > "$headers_file"
+
+          last_modified="$(awk 'tolower($0) ~ /^last-modified:/ {sub(/\r$/,""); sub(/^[^:]+: /,""); print; exit}' "$headers_file")"
+          etag="$(awk 'tolower($0) ~ /^etag:/ {sub(/\r$/,""); sub(/^[^:]+: /,""); gsub(/"/,""); print; exit}' "$headers_file")"
+          content_length="$(awk 'tolower($0) ~ /^content-length:/ {sub(/\r$/,""); sub(/^[^:]+: /,""); print; exit}' "$headers_file")"
+
+          if [ -z "$last_modified" ]; then
+            last_modified="unknown"
+          fi
+          if [ -z "$etag" ]; then
+            etag="no-etag"
+          fi
+          if [ -z "$content_length" ]; then
+            content_length="unknown"
+          fi
+
+          cache_segment="$(printf '%s|%s|%s\n' "$last_modified" "$etag" "$content_length" | sha256sum | cut -d' ' -f1)"
+
+          {
+            echo "last_modified=$last_modified"
+            echo "etag=$etag"
+            echo "content_length=$content_length"
+            echo "cache_segment=$cache_segment"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached upstream DMG
+        id: dmg-cache
+        uses: actions/cache@v6
+        with:
+          path: /tmp/codex-release-deb/Codex.dmg
+          key: release-deb-upstream-dmg-${{ env.DMG_CACHE_SCHEMA_VERSION }}-${{ steps.upstream-metadata.outputs.cache_segment }}
+
+      - name: Download upstream DMG
+        if: steps.dmg-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          curl_retry() {
+            local -a retry_args=(--retry 5 --retry-delay 2 --retry-connrefused)
+            if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+              retry_args+=(--retry-all-errors)
+            fi
+            curl "${retry_args[@]}" "$@"
+          }
+
+          mkdir -p "$(dirname "$UPSTREAM_DMG_PATH")"
+          curl_retry -fL --progress-bar -o "$UPSTREAM_DMG_PATH" "$UPSTREAM_DMG_URL"
+
+      - name: Record upstream DMG fingerprint
+        id: dmg
+        run: |
+          set -euo pipefail
+          test -s "$UPSTREAM_DMG_PATH"
+
+          sha256="$(sha256sum "$UPSTREAM_DMG_PATH" | cut -d' ' -f1)"
+          size_bytes="$(stat -c '%s' "$UPSTREAM_DMG_PATH")"
+          tested_at_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+          {
+            echo "sha256=$sha256"
+            echo "size_bytes=$size_bytes"
+            echo "tested_at_utc=$tested_at_utc"
+            echo "short_sha=${sha256:0:12}"
+          } >> "$GITHUB_OUTPUT"
+
+          cat > upstream-dmg-metadata.json <<JSON
+          {
+            "url": "$UPSTREAM_DMG_URL",
+            "path": "$UPSTREAM_DMG_PATH",
+            "last_modified": "${{ steps.upstream-metadata.outputs.last_modified }}",
+            "etag": "${{ steps.upstream-metadata.outputs.etag }}",
+            "content_length": "${{ steps.upstream-metadata.outputs.content_length }}",
+            "sha256": "$sha256",
+            "size_bytes": "$size_bytes",
+            "tested_at_utc": "$tested_at_utc",
+            "cache_schema_version": "${{ env.DMG_CACHE_SCHEMA_VERSION }}",
+            "upstream_repository": "$UPSTREAM_REPOSITORY",
+            "upstream_ref": "$UPSTREAM_REF",
+            "upstream_source_sha": "${{ steps.source.outputs.sha }}"
+          }
+          JSON
+
+      - name: Prepare release version
+        id: version
+        env:
+          LAST_MODIFIED: ${{ steps.upstream-metadata.outputs.last_modified }}
+          UPSTREAM_SOURCE_SHORT_SHA: ${{ steps.source.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          if dmg_timestamp="$(date -u -d "$LAST_MODIFIED" +%Y.%m.%d.%H%M%S 2>/dev/null)"; then
+            tag_timestamp="$(date -u -d "$LAST_MODIFIED" +%Y%m%d-%H%M%S)"
+          else
+            dmg_timestamp="1970.01.01.000000"
+            tag_timestamp="19700101-000000"
+          fi
+
+          version="${dmg_timestamp}+u${UPSTREAM_SOURCE_SHORT_SHA}"
+          tag="deb-${tag_timestamp}-u${UPSTREAM_SOURCE_SHORT_SHA}"
+          name="Codex Desktop Linux ${dmg_timestamp}"
+          asset_name="Codex-Desktop-Linux-${tag_timestamp}-u${UPSTREAM_SOURCE_SHORT_SHA}.deb"
+
+          {
+            echo "package_version=$version"
+            echo "release_tag=$tag"
+            echo "release_name=$name"
+            echo "asset_name=$asset_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check whether release already exists
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          FORCE_RELEASE: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+
+          exists=false
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exists=true
+          fi
+
+          should_build=true
+          if [ "$exists" = "true" ] && [ "$FORCE_RELEASE" != "true" ]; then
+            should_build=false
+          fi
+
+          {
+            echo "exists=$exists"
+            echo "should_build=$should_build"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$should_build" = "false" ]; then
+            echo "Release ${RELEASE_TAG} already exists; skipping rebuild."
+          fi
+
+      - uses: actions/setup-node@v6
+        if: steps.release.outputs.should_build == 'true'
+        with:
+          node-version: 24
+
+      - name: Install build dependencies
+        if: steps.release.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y \
+            build-essential \
+            curl \
+            dpkg-dev \
+            g++ \
+            make \
+            p7zip-full \
+            python3 \
+            unzip
+          rustup component add rustfmt clippy
+
+      - name: Build Linux app from upstream DMG
+        if: steps.release.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          cd wrapper
+          CODEX_PATCH_REPORT_JSON="$GITHUB_WORKSPACE/patch-report.json" \
+            make build-app DMG="$UPSTREAM_DMG_PATH"
+
+      - name: Validate required upstream patches
+        if: steps.release.outputs.should_build == 'true'
+        run: node wrapper/scripts/ci/validate-patch-report.js patch-report.json --profile upstream-build
+
+      - name: Build Debian package
+        if: steps.release.outputs.should_build == 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          cd wrapper
+          make deb PACKAGE_VERSION="$PACKAGE_VERSION"
+
+      - name: Inspect Debian package
+        if: steps.release.outputs.should_build == 'true'
+        id: package
+        env:
+          RELEASE_ASSET_NAME: ${{ steps.version.outputs.asset_name }}
+        run: |
+          set -euo pipefail
+          deb_file="$(find wrapper/dist -maxdepth 1 -name 'codex-desktop_*.deb' -print -quit)"
+          test -n "$deb_file"
+          release_file="dist/${RELEASE_ASSET_NAME}"
+
+          mkdir -p dist
+          dpkg-deb -I "$deb_file" | tee deb-control.txt
+          dpkg-deb -c "$deb_file" | tee deb-contents.txt >/dev/null
+          cp "$deb_file" "$release_file"
+          sha256="$(sha256sum "$release_file" | cut -d' ' -f1)"
+          size_bytes="$(stat -c '%s' "$release_file")"
+
+          {
+            echo "deb_file=$release_file"
+            echo "deb_name=$RELEASE_ASSET_NAME"
+            echo "original_deb_name=$(basename "$deb_file")"
+            echo "deb_sha256=$sha256"
+            echo "deb_size_bytes=$size_bytes"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifacts
+        if: always() && steps.release.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-desktop-linux-deb-${{ steps.version.outputs.release_tag || github.run_id }}
+          path: |
+            ${{ steps.package.outputs.deb_file }}
+            deb-control.txt
+            deb-contents.txt
+            patch-report.json
+            upstream-dmg-metadata.json
+          if-no-files-found: ignore
+
+      - name: Publish GitHub Release
+        if: steps.release.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          RELEASE_NAME: ${{ steps.version.outputs.release_name }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
+          DEB_FILE: ${{ steps.package.outputs.deb_file }}
+          DEB_NAME: ${{ steps.package.outputs.deb_name }}
+          DEB_SHA256: ${{ steps.package.outputs.deb_sha256 }}
+          DEB_SIZE_BYTES: ${{ steps.package.outputs.deb_size_bytes }}
+          DMG_SHA256: ${{ steps.dmg.outputs.sha256 }}
+          DMG_SIZE_BYTES: ${{ steps.dmg.outputs.size_bytes }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          release_notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$release_notes" <<EOF
+          This Debian package is built automatically from:
+
+          - Packaging source: \`${UPSTREAM_REPOSITORY}@${SOURCE_SHA}\`
+          - Official upstream DMG: \`${UPSTREAM_DMG_URL}\`
+          - Upstream DMG timestamp: \`${{ steps.upstream-metadata.outputs.last_modified }}\`
+          - Package version: \`${PACKAGE_VERSION}\`
+
+          Install with:
+
+          \`\`\`bash
+          sudo apt install ./$(basename "$DEB_FILE")
+          \`\`\`
+
+          Verification:
+
+          - Package SHA-256: \`${DEB_SHA256}\`
+          - Package size: \`${DEB_SIZE_BYTES}\` bytes
+          - Upstream DMG SHA-256: \`${DMG_SHA256}\`
+          - Upstream DMG size: \`${DMG_SIZE_BYTES}\` bytes
+          EOF
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$DEB_FILE" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_NAME" \
+              --notes-file "$release_notes"
+          else
+            gh release create "$RELEASE_TAG" "$DEB_FILE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_NAME" \
+              --notes-file "$release_notes"
+          fi
+
+      - name: Write release summary
+        if: always()
+        run: |
+          {
+            echo "## Debian Package Release"
+            echo ""
+            echo "- Packaging source: \`${UPSTREAM_REPOSITORY}@${{ steps.source.outputs.sha || 'unknown' }}\`"
+            echo "- Version: \`${{ steps.version.outputs.package_version || 'unknown' }}\`"
+            echo "- Release tag: \`${{ steps.version.outputs.release_tag || 'unknown' }}\`"
+            echo "- Should build: \`${{ steps.release.outputs.should_build || 'unknown' }}\`"
+            echo "- Existing release: \`${{ steps.release.outputs.exists || 'unknown' }}\`"
+            echo "- Package: \`${{ steps.package.outputs.deb_name || 'not built' }}\`"
+            echo "- Package SHA-256: \`${{ steps.package.outputs.deb_sha256 || 'unknown' }}\`"
+            echo "- Upstream DMG SHA-256: \`${{ steps.dmg.outputs.sha256 || 'unknown' }}\`"
+            echo "- Cache hit: \`${{ steps.dmg-cache.outputs.cache-hit || 'false' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
