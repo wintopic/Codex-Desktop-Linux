@@ -20,6 +20,6 @@ Inputs:
 
 ## Release Naming
 
-Release tags include both the upstream DMG timestamp and the upstream packaging
-source commit, so a packaging-source update can produce a new release even when
-the official DMG has not changed.
+Release tags include the upstream DMG timestamp, the upstream DMG SHA-256 short
+ID, and the upstream packaging source commit. A new package is produced when the
+official DMG content changes or the packaging source changes.

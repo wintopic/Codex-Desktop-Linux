@@ -166,6 +166,7 @@ jobs:
       - name: Prepare release version
         id: version
         env:
+          DMG_SHORT_SHA: ${{ steps.dmg.outputs.short_sha }}
           LAST_MODIFIED: ${{ steps.upstream-metadata.outputs.last_modified }}
           UPSTREAM_SOURCE_SHORT_SHA: ${{ steps.source.outputs.short_sha }}
         run: |
@@ -178,10 +179,10 @@ jobs:
             tag_timestamp="19700101-000000"
           fi
 
-          version="${dmg_timestamp}+u${UPSTREAM_SOURCE_SHORT_SHA}"
-          tag="deb-${tag_timestamp}-u${UPSTREAM_SOURCE_SHORT_SHA}"
+          version="${dmg_timestamp}+d${DMG_SHORT_SHA}.u${UPSTREAM_SOURCE_SHORT_SHA}"
+          tag="deb-${tag_timestamp}-d${DMG_SHORT_SHA}-u${UPSTREAM_SOURCE_SHORT_SHA}"
           name="Codex Desktop Linux ${dmg_timestamp}"
-          asset_name="Codex-Desktop-Linux-${tag_timestamp}-u${UPSTREAM_SOURCE_SHORT_SHA}.deb"
+          asset_name="Codex-Desktop-Linux-${tag_timestamp}-d${DMG_SHORT_SHA}-u${UPSTREAM_SOURCE_SHORT_SHA}.deb"
 
           {
             echo "package_version=$version"
